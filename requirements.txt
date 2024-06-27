@@ -1,0 +1,12 @@
+jupyter
+ipywidgets
+tensorflow==2.10.1
+numpy
+matplotlib
+scipy
+scikit-image
+pandas
+openpyxl
+tqdm
+tensorflow-io==0.26.0
+cache-magic
