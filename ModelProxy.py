@@ -29,6 +29,14 @@ class ModelProxy(abc.ABC):
     def generate(self, source_domain, target_domain, batch):
         return
 
+    @abc.abstractmethod
+    def encode(self, source_domain, target_domain, batch):
+        pass
+
+    @abc.abstractmethod
+    def decode(self, source_domain, target_domain, code_batch):
+        pass
+
 
 class Pix2PixModelProxy(ModelProxy):
     def __init__(self, path, post_process=False):
@@ -60,6 +68,22 @@ class Pix2PixModelProxy(ModelProxy):
             source_palette = batch_extract_palette(source_image)
             genned_image = self.post_processor.quantize_to_palette(genned_image, source_palette)
         return genned_image
+
+    def encode(self, source_domain, target_domain, batch):
+        model = self._select_model(source_domain, target_domain)
+        model.summary(expand_nested=True)
+        surrogate_model = tf.keras.Model(inputs=model.inputs, outputs=model.get_layer("sequential_6").outputs)
+        source_image = tf.gather(batch, source_domain)
+        encoded = surrogate_model(source_image, training=True)
+        del surrogate_model
+        return encoded
+
+    def decode(self, source_domain, target_domain, code_batch):
+        model = self._select_model(source_domain, target_domain)
+        surrogate_model = tf.keras.Model(inputs=model.get_layer("sequential_6").input, outputs=model.output)
+        decoded = surrogate_model(code_batch, training=True)
+        del surrogate_model
+        return decoded
 
     def __del__(self):
         del self.model
@@ -110,6 +134,22 @@ class StarGANModelProxy(ModelProxy):
             genned_image = self.post_processor.quantize_to_palette(genned_image, source_palette)
         return genned_image
 
+    def encode(self, source_domain, target_domain, batch):
+        batch_shape = tf.shape(batch)
+        batch_size = batch_shape[1]
+
+        source_image = tf.gather(batch, source_domain)
+        source_domain = tf.constant(source_domain, tf.int32)
+        source_domain = tf.tile(source_domain[tf.newaxis, ...], [batch_size, ])
+        target_domain = tf.constant(target_domain, tf.int32)
+        target_domain = tf.tile(target_domain[tf.newaxis, ...], [batch_size, ])
+        surrogate_model = tf.keras.Model(inputs=self.model.input, outputs=self.model.get_layer("add_5").output)
+        return surrogate_model([source_image, target_domain, source_domain], training=True)
+
+    def decode(self, source_domain, target_domain, code_batch):
+        surrogate_model = tf.keras.Model(inputs=self.model.get_layer("add_5").input, outputs=self.model.output)
+        return surrogate_model(code_batch, training=True)
+
 
 class CollaGANModelProxy(ModelProxy):
     def __init__(self, path, post_process=False):
@@ -158,3 +198,30 @@ class CollaGANModelProxy(ModelProxy):
             genned_image = self.post_processor.quantize_to_palette(genned_image, source_palette)
 
         return genned_image
+
+    def encode(self, source_domain, target_domain, batch):
+        batch_shape = tf.shape(batch)
+        number_of_domains, batch_size = len(DOMAINS), batch_shape[1]
+
+        # so we can do the post process, let's keep the source image
+        source_image = batch[source_domain]
+
+        keep_image_mask = tf.constant([1 if i == source_domain else 0 for i in range(number_of_domains)])
+        # keep_image_mask.shape is [d]
+        keep_image_mask = tf.tile(keep_image_mask[..., tf.newaxis, tf.newaxis, tf.newaxis, tf.newaxis],
+                                  [1, batch_size, 1, 1, 1])
+        # keep_image_mask.shape is [d, b, 1, 1, 1]
+        batch *= tf.cast(keep_image_mask, tf.float32)
+
+        # rearranges the batch so that the batch dimension becomes the first one
+        batch = tf.transpose(batch, [1, 0, 2, 3, 4])
+        # batch.shape is [b, d, h, w, c]
+
+        target_domain = tf.constant(target_domain, tf.int32)
+        target_domain = tf.tile(target_domain[tf.newaxis, ...], [batch_size, ])
+        surrogate_model = tf.keras.Model(inputs=self.model.input, outputs=self.model.get_layer("re_lu_33").output)
+        return surrogate_model([batch, target_domain], training=True)
+
+    def decode(self, source_domain, target_domain, code_batch):
+        surrogate_model = tf.keras.Model(inputs=self.model.get_layer("re_lu_33").input, outputs=self.model.output)
+        return surrogate_model(code_batch, training=True)
