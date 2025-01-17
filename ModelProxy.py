@@ -111,6 +111,107 @@ class Pix2PixModelProxy(ModelProxy):
         }
 
 
+class IndexedPix2PixModelProxy(Pix2PixModelProxy):
+    def __init__(self, path, post_process=False):
+        super().__init__(path, post_process)
+
+    @staticmethod
+    def _single_extract_palette(image):
+        # incoming image shape: (s, s, c)
+        # reshaping to: (s*s, c)
+        channels = 4
+        image = tf.reshape(image, [-1, channels])
+
+        # colors are sorted as they appear in the image sweeping from top-left to bottom-right
+        colors, _ = tf.raw_ops.UniqueV2(x=image, axis=[0])
+
+        # now sort according to their grayness value (this is the sorting done in the aiide paper)
+        gray_coefficients = tf.constant([0.2989, 0.5870, 0.1140, 0.])[..., tf.newaxis]
+        grayness = tf.squeeze(tf.matmul(tf.cast(colors, "float32"), gray_coefficients))
+        indices_sorted_by_grayness = tf.argsort(grayness, direction="ASCENDING", stable=True)
+        colors = tf.gather(colors, indices_sorted_by_grayness)
+
+        return colors
+
+    @staticmethod
+    def _extract_palette(images):
+        palettes_ragged = tf.map_fn(fn=IndexedPix2PixModelProxy._single_extract_palette, elems=images,
+                                    fn_output_signature=tf.RaggedTensorSpec(
+                                        ragged_rank=0,
+                                        dtype=tf.int32))
+        palettes = tf.RaggedTensor.to_tensor(palettes_ragged, default_value=tf.constant([255, 0, 255, 255],
+                                                                                        dtype=tf.int32))
+        return palettes
+
+    @staticmethod
+    def _single_rgba_to_indexed(image, palette):
+        shape = tf.shape(image)
+        s, c = shape[0], shape[2]
+        flattened_image = tf.reshape(image, [s*s, c])
+        num_pixels, num_components = s*s, c
+
+        indices = flattened_image == palette[:, None]
+        row_sums = tf.reduce_sum(tf.cast(indices, "int32"), axis=2)
+        results = tf.cast(tf.where(row_sums == num_components), "int32")
+
+        color_indices, pixel_indices = results[:, 0], results[:, 1]
+        pixel_indices = tf.expand_dims(pixel_indices, -1)
+
+        indexed = tf.scatter_nd(pixel_indices, color_indices, [num_pixels])
+        indexed = tf.reshape(indexed, [shape[0], shape[1], 1])
+        return indexed
+
+    @staticmethod
+    def _batch_rgba_to_indexed(batch, palettes):
+        batch_shape = tf.shape(batch)
+        d, b = batch_shape[0], batch_shape[1]
+        indexed_batch = []
+        for i in range(d):
+            indexed_images = []
+            for j in range(b):
+                indexed_images.append(IndexedPix2PixModelProxy._single_rgba_to_indexed(batch[i][j], palettes[j]))
+            indexed_batch.append(tf.stack(indexed_images, axis=0))
+        indexed_batch = tf.stack(indexed_batch, axis=0)
+        return indexed_batch
+
+    @staticmethod
+    def _indexed_to_rgba(indexed_images, palettes):
+        b, s, _, _ = tf.shape(indexed_images)
+        c = tf.shape(palettes)[-1]
+        image_rgba = tf.gather(palettes, indexed_images, batch_dims=1)
+        image_rgba = tf.reshape(image_rgba, [b, s, s, c])
+        image_rgba = tf.cast(image_rgba, tf.float32) / 127.5 - 1.0
+        return image_rgba
+
+    def generate(self, source_domain, target_domain, batch):
+        # batch comes as [-1, 1] float32 tensors...
+        # convert the batch to int32 [0, 255] tensors
+        batch = tf.cast((batch + 1.) * 127.5, tf.int32)
+
+        # gets the source_image, so we can extract its palette
+        source_image = tf.gather(batch, source_domain)
+        target_image = tf.gather(batch, target_domain)
+        combin_image = tf.concat([source_image, target_image], axis=-1)
+
+        # extracts the int32 palette from the combined source and target image
+        # palette = IndexedPix2PixModelProxy._extract_palette(combin_image)
+        palette = IndexedPix2PixModelProxy._extract_palette(combin_image)
+
+        # converts the batch to indexed images
+        indexed_batch = IndexedPix2PixModelProxy._batch_rgba_to_indexed(batch, palette)
+
+        # asks the regular Pix2PixModelProxy to generate the image, which will be a 64x64 indexed image
+        genned_image_probabilities = super().generate(source_domain, target_domain, indexed_batch)
+
+        # convert the probabilities to an indexed image
+        genned_image = tf.argmax(genned_image_probabilities, axis=-1, output_type=tf.int32)[..., tf.newaxis]
+
+        # convert the indexed image to an RGBA image in the range of [-1, 1] in float32
+        genned_image = IndexedPix2PixModelProxy._indexed_to_rgba(genned_image, palette)
+
+        return genned_image
+
+
 class StarGANModelProxy(ModelProxy):
     def __init__(self, path, post_process=False):
         super().__init__("StarGAN", path, post_process)
