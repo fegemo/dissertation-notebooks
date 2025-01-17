@@ -120,15 +120,16 @@ def show_single_input_model_comparison(source_images, target_images, genned_imag
     column_titles = ["Source", "Target", *model_names]
     column_contents = [source_images, target_images, *genned_images]
 
-    plt.figure(figsize=(2 * cols, 2 * rows))
+    fig = plt.figure(figsize=(8 * cols, 8 * rows))
     plt.suptitle(title)
     for i in range(rows):
         for j in range(cols):
             index = i * cols + j + 1
             plt.subplot(rows, cols, index)
-            plt.title(column_titles[j] if i == 0 else "")
+            plt.title(column_titles[j] if i == 0 else "", fontsize=48)
             plt.imshow(column_contents[j][i], interpolation="nearest")
             plt.axis("off")
+    fig.patch.set_alpha(0.0)
     plt.tight_layout()
     plt.show()
 
