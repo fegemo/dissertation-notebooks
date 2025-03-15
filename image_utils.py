@@ -257,11 +257,11 @@ def show_collagan3_and_baseline_comparison(source_images, target_images, genned_
             sub_figs[i, j].patch.set_alpha(0.0)
 
             if is_subplot_column(j):
-                if j == 0 or column_titles[j] != "CollaGAN-2":
+                if j == 0 or not column_titles[j].endswith("-2"):
                     # get a 2x2 subplots axes
                     axes = sub_figs[i, j].subplots(half_domains, half_domains)
                 else:
-                    # get a 1 then 2 subplots axes (for CollaGAN-2)
+                    # get a 1 then 2 subplots axes (for CollaGAN-2 and ReMIC-2)
                     axes = []
 
                     middle_at_top = [0.325, 0.525, 0.35, 0.35]
@@ -300,9 +300,9 @@ def show_collagan3_and_baseline_comparison(source_images, target_images, genned_
                                         verticalalignment=va, transform=ax.transAxes, fontsize=40)
                         else:
                             # a real image to show
-                            if column_titles[j] in ["Pix2Pix", "StarGAN", "CollaGAN-1"]:
+                            if column_titles[j] in ["Pix2Pix", "StarGAN", "CollaGAN-1", "ReMIC-1"]:
                                 ax.set_title(f"From {DOMAINS[source_index]}", fontsize=32, y=1, pad=-8)
-                            elif column_titles[j] == "CollaGAN-2":
+                            elif column_titles[j].endswith("-2"):
                                 additional_non_source = i_d * 2 + j_d
                                 target_index = target_indices[i]
                                 source_domains = [n for n in range(4) if

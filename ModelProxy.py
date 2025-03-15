@@ -8,6 +8,27 @@ from post_process import batch_extract_palette, PostProcessor
 
 DOMAINS = ["back", "left", "front", "right"]
 
+class MultiInputTFSMLayer(tf.keras.layers.Layer):
+    def __init__(self, model_path, input_names, **kwargs):
+        super(MultiInputTFSMLayer, self).__init__(**kwargs)
+        self.model_path = model_path
+        self.input_names = input_names
+        self.model = tf.saved_model.load(model_path)
+
+    def call(self, inputs):
+        inputs_dict = dict(zip(self.input_names, inputs))
+        outputs = self.model.signatures["serving_default"](**inputs_dict)
+        return outputs
+
+    def get_config(self):
+        config = super(MultiInputTFSMLayer, self).get_config()
+        config.update({
+            "model_path": self.model_path,
+            "input_names": self.input_names
+        })
+        return config
+
+
 
 class ModelProxy(abc.ABC):
     def __init__(self, name, path, post_process):
@@ -20,6 +41,12 @@ class ModelProxy(abc.ABC):
     @abc.abstractmethod
     def _load_model(self, path):
         pass
+
+    def _load_saved_model(self, path, input_names=None):
+        if tf.keras.__version__ >= "3":
+            return MultiInputTFSMLayer(path, input_names=input_names)
+        else:
+            return tf.keras.models.load_model(path, compile=False)
 
     # Generates an image by translating it from the source_domain into the target_domain
     # @param source_domain the index of the source domain
@@ -54,7 +81,7 @@ class Pix2PixModelProxy(ModelProxy):
             del self.model
             gc.collect()
             logging.info(f"Start >> Loading Pix2Pix model {source_name}-to-{target_name}")
-            self.model = tf.keras.models.load_model(self.model_paths[f"{source_name}-to-{target_name}"], compile=False)
+            self.model = self._load_saved_model(self.model_paths[f"{source_name}-to-{target_name}"])
             # self.model = PostProcessGenerator(self.model, "cielab") if self.post_process else self.model
             self.loaded_model = f"{source_name}-to-{target_name}"
             logging.info(f"End   >> Loading Pix2Pix model {source_name}-to-{target_name}")
@@ -63,7 +90,7 @@ class Pix2PixModelProxy(ModelProxy):
     def generate(self, source_domain, target_domain, batch):
         model = self._select_model(source_domain, target_domain)
         source_image = tf.gather(batch, source_domain)
-        genned_image = model(source_image, training=True)
+        genned_image = model(source_image)
         if self.post_process:
             source_palette = batch_extract_palette(source_image)
             genned_image = self.post_processor.quantize_to_palette(genned_image, source_palette)
@@ -74,14 +101,14 @@ class Pix2PixModelProxy(ModelProxy):
         model.summary(expand_nested=True)
         surrogate_model = tf.keras.Model(inputs=model.inputs, outputs=model.get_layer("sequential_6").outputs)
         source_image = tf.gather(batch, source_domain)
-        encoded = surrogate_model(source_image, training=True)
+        encoded = surrogate_model(source_image)
         del surrogate_model
         return encoded
 
     def decode(self, source_domain, target_domain, code_batch):
         model = self._select_model(source_domain, target_domain)
         surrogate_model = tf.keras.Model(inputs=model.get_layer("sequential_6").input, outputs=model.output)
-        decoded = surrogate_model(code_batch, training=True)
+        decoded = surrogate_model(code_batch)
         del surrogate_model
         return decoded
 
@@ -229,7 +256,7 @@ class StarGANModelProxy(ModelProxy):
         target_domain = tf.constant(target_domain, tf.int32)
         target_domain = tf.tile(target_domain[tf.newaxis, ...], [batch_size, ])
         # genned_image = self.model([source_image, target_domain], training=True)
-        genned_image = self.model([source_image, target_domain, source_domain], training=True)
+        genned_image = self.model([source_image, target_domain, source_domain])
         if self.post_process:
             source_palette = batch_extract_palette(source_image)
             genned_image = self.post_processor.quantize_to_palette(genned_image, source_palette)
@@ -245,11 +272,11 @@ class StarGANModelProxy(ModelProxy):
         target_domain = tf.constant(target_domain, tf.int32)
         target_domain = tf.tile(target_domain[tf.newaxis, ...], [batch_size, ])
         surrogate_model = tf.keras.Model(inputs=self.model.input, outputs=self.model.get_layer("add_5").output)
-        return surrogate_model([source_image, target_domain, source_domain], training=True)
+        return surrogate_model([source_image, target_domain, source_domain])
 
     def decode(self, source_domain, target_domain, code_batch):
         surrogate_model = tf.keras.Model(inputs=self.model.get_layer("add_5").input, outputs=self.model.output)
-        return surrogate_model(code_batch, training=True)
+        return surrogate_model(code_batch)
 
 
 class CollaGANModelProxy(ModelProxy):
@@ -257,7 +284,15 @@ class CollaGANModelProxy(ModelProxy):
         super().__init__("CollaGAN", path, post_process)
 
     def _load_model(self, path):
-        return tf.keras.models.load_model(path, compile=False)
+        m = self._load_saved_model(path, ["target_domain", "source_images"])
+        # m = tf.saved_model.load(path)
+        # print("m:", m)
+        # print("m.signatures:", m.signatures)
+        # print("m.signatures['serving_default']:", m.signatures['serving_default'])
+        # print("m.signatures['serving_default'].structured_outputs:", m.signatures['serving_default'].structured_outputs)
+        # print("m.signatures['serving_default'].structured_inputs:", m.signatures['serving_default'].structured_inputs)
+
+        return m
 
     # Generates images from a single source domain
     def generate(self, source_domain, target_domain, batch):
@@ -280,7 +315,7 @@ class CollaGANModelProxy(ModelProxy):
 
         target_domain = tf.constant(target_domain, tf.int32)
         target_domain = tf.tile(target_domain[tf.newaxis, ...], [batch_size, ])
-        genned_image = self.model([batch, target_domain], training=True)
+        genned_image = self.model([batch, target_domain])
 
         if self.post_process:
             source_palette = batch_extract_palette(source_image)
@@ -289,7 +324,8 @@ class CollaGANModelProxy(ModelProxy):
         return genned_image
 
     def generate_from_multiple(self, target_domain, batch_transpose):
-        genned_image = self.model([batch_transpose, target_domain], training=True)
+        target_domain = tf.cast(target_domain, tf.float32)
+        genned_image = self.model([batch_transpose, target_domain])
         if self.post_process:
             # batch_transpose has shape (b, d, h, w, c)
             batch_shape = tf.shape(batch_transpose)
@@ -321,8 +357,109 @@ class CollaGANModelProxy(ModelProxy):
         target_domain = tf.constant(target_domain, tf.int32)
         target_domain = tf.tile(target_domain[tf.newaxis, ...], [batch_size, ])
         surrogate_model = tf.keras.Model(inputs=self.model.input, outputs=self.model.get_layer("re_lu_33").output)
-        return surrogate_model([batch, target_domain], training=True)
+        return surrogate_model([batch, target_domain])
 
     def decode(self, source_domain, target_domain, code_batch):
         surrogate_model = tf.keras.Model(inputs=self.model.get_layer("re_lu_33").input, outputs=self.model.output)
-        return surrogate_model(code_batch, training=True)
+        return surrogate_model(code_batch)
+
+
+class RemicModelProxy(ModelProxy):
+    def encode(self, source_domain, target_domain, batch):
+        raise NotImplementedError("RemicModelProxy has not implemented encoding yet")
+        # uce = self.model["unified_content_encoder"]
+        # secs = self.model["style_encoders"]
+        #
+        # content_code = uce.predict(batch, verbose=0)
+        # style_code = secs[source_domain].predict(batch, verbose=0)
+        # return content_code, style_code
+
+    def decode(self, source_domain, target_domain, code_batch):
+        raise NotImplementedError("RemicModelProxy has not implemented decoding yet")
+
+    def __init__(self, path, post_process=False):
+        super().__init__("ReMIC", path, post_process)
+
+    def _load_model(self, path):
+        domain_initial_letters = [d[0].upper() for d in DOMAINS]
+        paths = {
+            "decoders": [f"{path}/decoders/Decoder{letter}" for letter in domain_initial_letters],
+            "style_encoders": [f"{path}/style_encoders/StyleEncoder{letter}" for letter in domain_initial_letters],
+            "unified_content_encoder": f"{path}/unified_content_encoder",
+        }
+        # each decoder has input of [(b, 8), (b, 16, 16, 256)] and output of (b, 64, 64, 4)
+        # each style encoder has input of (b, 64, 64, 4) and output of (b, 8)
+        # the unified content encoder has input of (b, d, 64, 64, 4) and output of (b, 16, 16, 256)
+        return {
+            "decoders": [self._load_saved_model(model_path) for model_path in paths["decoders"]],
+            "style_encoders": [self._load_saved_model(model_path) for model_path in paths["style_encoders"]],
+            "unified_content_encoder": self._load_saved_model(paths["unified_content_encoder"])
+        }
+
+    # Generates images from a single source domain to a single target domain
+    def generate(self, source_domain, target_domain, batch):
+        batch_shape = tf.shape(batch)
+        number_of_domains, batch_size = len(DOMAINS), batch_shape[1]
+
+        # so we can do the post process, let's keep the source image
+        source_image = batch[source_domain]
+
+        keep_image_mask = tf.constant([1 if i == source_domain else 0 for i in range(number_of_domains)])
+        # keep_image_mask.shape is [d]
+        keep_image_mask = tf.tile(keep_image_mask[..., tf.newaxis, tf.newaxis, tf.newaxis, tf.newaxis],
+                                  [1, batch_size, 1, 1, 1])
+        # keep_image_mask.shape is [d, b, 1, 1, 1]
+        batch *= tf.cast(keep_image_mask, tf.float32)
+
+        # rearranges the batch so that the batch dimension becomes the first one
+        batch = tf.transpose(batch, [1, 0, 2, 3, 4])
+        # batch.shape is [b, d, h, w, c]
+
+        bs = 4
+        uce = self.model["unified_content_encoder"]
+        sec = self.model["style_encoders"]
+        dec = self.model["decoders"]
+        content_code = uce.predict(batch, batch_size=bs, verbose=0)
+        # content_code.shape is (b, 16, 16, 256)
+        style_code = sec[source_domain].predict(batch, batch_size=bs, verbose=0)
+        # style_code.shape is (b, 8)
+        genned_image = dec[target_domain].predict([style_code, content_code], batch_size=bs, verbose=0)
+        # genned_image.shape is (b, 64, 64, 4)
+
+        if self.post_process:
+            source_palette = batch_extract_palette(source_image)
+            genned_image = self.post_processor.quantize_to_palette(genned_image, source_palette)
+
+        return genned_image
+
+    def generate_from_multiple(self, target_domain, batch_transpose, style_code=None):
+        """
+        :param target_domain: a tensor with the target domain with shape [b]
+        :param batch_transpose: input images with shape [b, d, h, w, c] and at least one image dropped out
+        for each example in the batch
+        :param style_code: a tensor with hardcoded random style codes to be used with shape [b, 8]
+        :return:
+        """
+        batch_size = tf.shape(target_domain)[0].numpy()
+        bs = 4
+        uce = self.model["unified_content_encoder"]
+        secs = self.model["style_encoders"]
+        decs = self.model["decoders"]
+
+        # there can be a different target_domain for each element in the batch -- hence, we cannot use a single
+        # style encoder and decoder (we need to traverse the batch)...
+
+        content_code = uce.predict(batch_transpose, batch_size=bs, verbose=0)
+        # content_code.shape is (b, 16, 16, 256)
+
+        if style_code is None:
+            style_code = [secs[target_domain[b]].predict(batch_transpose[b, target_domain[b]][tf.newaxis, ...], verbose=0)
+                          for b in range(batch_size)]
+        # style_code.shape is (b, 1, 8)
+
+        genned_image = [decs[target_domain[b]].predict([style_code[b], content_code[b][tf.newaxis, ...]], verbose=0)[0]
+                        for b in range(batch_size)]
+        genned_image = tf.concat(genned_image, axis=0)
+        # genned_image.shape is (b, 64, 64, 4)
+
+        return genned_image
