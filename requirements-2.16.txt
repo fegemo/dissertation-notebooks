@@ -1,6 +1,6 @@
 notebook
 ipywidgets
-tensorflow[and-cuda]==2.18.0
+tensorflow[and-cuda]==2.16.2
 tensorflow-io
 numpy
 matplotlib
